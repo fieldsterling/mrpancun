@@ -25,8 +25,11 @@ export interface SyncPayload {
  */
 export async function syncDaily(payload: SyncPayload): Promise<{ ok: boolean }> {
   if (!supabase) throw new Error('未配置 Supabase，无法同步')
+  // 照片 base64（photo / photo_thumb）仅本地存储，同步时剔除；
+  // photo_url（云端地址）、deleted_at（软删除标记）、customer（出库客户）正常上传。
+  const products = payload.products.map(({ photo: _photo, photo_thumb: _thumb, ...rest }) => rest)
   const { data, error } = await supabase.functions.invoke('sync-daily', {
-    body: payload,
+    body: { ...payload, products },
   })
   if (error) throw new Error(`同步失败：${error.message}`)
   return data as { ok: boolean }

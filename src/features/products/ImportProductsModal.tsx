@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import * as XLSX from 'xlsx'
-import { bulkUpsertProducts } from '@/lib/localDb'
+import { importProductsWithJournal } from '@/lib/localDb'
+import { todayCN } from '@/lib/date'
 import type { Product } from '@/lib/types'
 import { Modal, useToast } from '@/components/ui'
 
@@ -12,8 +13,13 @@ interface Props {
 
 type Raw = Record<string, unknown>
 
+type ImportableKey = keyof Omit<
+  Product,
+  'updated_at' | 'created_at' | 'photo' | 'photo_thumb' | 'photo_url' | 'deleted_at'
+>
+
 /** 列名别名映射（中英文均支持，大小写不敏感） */
-const FIELD_ALIASES: Record<keyof Omit<Product, 'updated_at'>, string[]> = {
+const FIELD_ALIASES: Record<ImportableKey, string[]> = {
   code: ['产品编号', '编号', 'code', '商品编号', 'productcode'],
   name: ['名称', '品名', 'name', '商品名称'],
   category: ['类别', '分类', 'category'],
@@ -21,13 +27,15 @@ const FIELD_ALIASES: Record<keyof Omit<Product, 'updated_at'>, string[]> = {
   qty: ['数量', '库存', 'qty', 'quantity', '库存数量'],
   gram_weight: ['克重', '重量', '克重(g)', 'gram_weight', 'weight'],
   gram_price: ['克单价', '克价', '单价', 'gram_price', 'price'],
+  gram_fee: ['克工费', '工费克', '工费每克', 'gram_fee'],
+  piece_fee: ['件工费', '工费件', '工费每件', 'piece_fee'],
   total_price: ['总价', 'total_price'],
   barcode: ['条码', '条形码', 'barcode'],
   store: ['店名', '门店', 'store'],
 }
 
 /** 按别名查找字段值（首列命中优先） */
-function field(r: Raw, key: keyof Omit<Product, 'updated_at'>): unknown {
+function field(r: Raw, key: ImportableKey): unknown {
   for (const alias of FIELD_ALIASES[key]) {
     const lower = alias.toLowerCase()
     for (const [k, v] of Object.entries(r)) {
@@ -46,34 +54,46 @@ function toNum(v: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
-/** 将表行对象解析为产品记录 */
-function parseRows(rows: Raw[], defaultStore: string): Product[] {
+/** 将表行对象解析为产品记录；文件指定了其他店名的行会被跳过（禁止污染其他门店库存） */
+function parseRows(rows: Raw[], defaultStore: string): { products: Product[]; skipped: number } {
   const out: Product[] = []
+  let skipped = 0
   const now = new Date().toISOString()
   for (const r of rows) {
     const code = String(field(r, 'code') ?? '').trim()
     if (!code) continue
+    const rowStore = String(field(r, 'store') ?? '').trim()
+    if (rowStore && rowStore !== defaultStore) {
+      skipped++
+      continue
+    }
     const gramWeight = toNum(field(r, 'gram_weight'))
     const gramPrice = toNum(field(r, 'gram_price'))
+    const gramFee = toNum(field(r, 'gram_fee'))
+    const pieceFee = toNum(field(r, 'piece_fee'))
     const qty = toNum(field(r, 'qty'))
-    const calcTotal = Math.round(gramWeight * gramPrice * qty * 100) / 100
+    // 总价 = (克重 × (克单价 + 克工费) + 件工费) × 数量
+    const calcTotal =
+      Math.round((gramWeight * (gramPrice + gramFee) + pieceFee) * qty * 100) / 100
     const total = toNum(field(r, 'total_price')) || calcTotal
-    const store = String(field(r, 'store') ?? '').trim() || defaultStore
     out.push({
       code,
-      store,
+      store: rowStore || defaultStore,
       category: String(field(r, 'category') ?? '').trim(),
       name: String(field(r, 'name') ?? '').trim(),
       material: String(field(r, 'material') ?? '').trim(),
       qty,
       gram_weight: gramWeight,
       gram_price: gramPrice,
+      gram_fee: gramFee,
+      piece_fee: pieceFee,
       total_price: total,
       barcode: String(field(r, 'barcode') ?? '').trim(),
       updated_at: now,
+      created_at: now,
     })
   }
-  return out
+  return { products: out, skipped }
 }
 
 /** 简单 CSV 解析：处理双引号包裹的字段 */
@@ -109,9 +129,9 @@ function detectSep(line: string): string {
 }
 
 /** 解析 TXT / CSV：有表头则按表头映射；无表头按固定列顺序 编号,名称,类别,材质,数量,克重,克单价,总价,条码,店名 */
-function parseText(text: string, defaultStore: string): Product[] {
+function parseText(text: string, defaultStore: string): { products: Product[]; skipped: number } {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
-  if (lines.length === 0) return []
+  if (lines.length === 0) return { products: [], skipped: 0 }
   const sep = detectSep(lines[0])
   const isHeader =
     /(编号|产品编号|code|名称|品名|name|条码|barcode|克重|重量|材质|material)/i.test(lines[0]) &&
@@ -134,6 +154,7 @@ function parseText(text: string, defaultStore: string): Product[] {
       rows.push({
         编号: c[0], 名称: c[1], 类别: c[2], 材质: c[3], 数量: c[4],
         克重: c[5], 克单价: c[6], 总价: c[7], 条码: c[8], 店名: c[9],
+        克工费: c[10], 件工费: c[11],
       })
     }
   }
@@ -152,7 +173,7 @@ export default function ImportProductsModal({ store, onClose, onImported }: Prop
     if (!f) return
     const name = f.name.toLowerCase()
     try {
-      let parsed: Product[] = []
+      let parsed: { products: Product[]; skipped: number }
       if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
         const wb = XLSX.read(await f.arrayBuffer())
         const ws = wb.Sheets[wb.SheetNames[0]]
@@ -165,8 +186,9 @@ export default function ImportProductsModal({ store, onClose, onImported }: Prop
         return
       }
       setFileName(f.name)
-      setRows(parsed)
-      if (parsed.length === 0) show('未解析到有效产品（需包含「编号」列）', 'err')
+      setRows(parsed.products)
+      if (parsed.skipped > 0) show(`已跳过 ${parsed.skipped} 条「店名不一致」的记录`, 'info')
+      if (parsed.products.length === 0) show('未解析到有效产品（需包含「编号」列）', 'err')
     } catch (e) {
       setRows(null)
       show(`导入失败：${(e as Error).message}`, 'err')
@@ -177,8 +199,11 @@ export default function ImportProductsModal({ store, onClose, onImported }: Prop
     if (!rows || rows.length === 0) return
     setImporting(true)
     try {
-      await bulkUpsertProducts(rows)
-      show(`已导入 ${rows.length} 条产品`, 'ok')
+      const journalCount = await importProductsWithJournal(rows, `产品导入 ${todayCN()}`)
+      show(
+        `已导入 ${rows.length} 条产品` + (journalCount > 0 ? `，生成入库流水 ${journalCount} 条` : ''),
+        'ok',
+      )
       onImported(rows.length)
       onClose()
     } catch (e) {
@@ -193,7 +218,8 @@ export default function ImportProductsModal({ store, onClose, onImported }: Prop
     <Modal title="导入产品信息表" onClose={onClose}>
       <div className="muted mb">
         支持 <b>Excel（.xlsx / .xls）</b> 与 <b>TXT / CSV</b>。列名支持：编号、名称、类别、材质、数量、克重、
-        克单价、总价、条码、店名（缺省用当前门店）。未填总价时自动按「克重 × 克单价 × 数量」计算。
+        克单价、克工费、件工费、总价、条码、店名（缺省用当前门店）。未填总价时自动按
+        「(克重 × (克单价 + 克工费) + 件工费) × 数量」计算。
       </div>
 
       <label className="btn btn-primary mb">
@@ -227,6 +253,8 @@ export default function ImportProductsModal({ store, onClose, onImported }: Prop
                   <th className="t-num">数量</th>
                   <th className="t-num">克重</th>
                   <th className="t-num">克单价</th>
+                  <th className="t-num">克工费</th>
+                  <th className="t-num">件工费</th>
                   <th>店名</th>
                 </tr>
               </thead>
@@ -240,6 +268,8 @@ export default function ImportProductsModal({ store, onClose, onImported }: Prop
                     <td className="t-num">{p.qty}</td>
                     <td className="t-num">{p.gram_weight}</td>
                     <td className="t-num">{p.gram_price}</td>
+                    <td className="t-num">{p.gram_fee || 0}</td>
+                    <td className="t-num">{p.piece_fee || 0}</td>
                     <td>{p.store}</td>
                   </tr>
                 ))}

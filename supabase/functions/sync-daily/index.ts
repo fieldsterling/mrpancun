@@ -13,11 +13,22 @@ const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
 
+// 浏览器直调需要 CORS：Supabase 不会自动给函数响应加跨域头，必须自己处理 OPTIONS 预检
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Max-Age': '86400',
+}
+
 Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS_HEADERS })
+  }
   if (req.method !== 'POST') {
     return new Response(JSON.stringify({ ok: false, error: 'method not allowed' }), {
       status: 405,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
     })
   }
 
@@ -53,12 +64,12 @@ Deno.serve(async (req) => {
         journal: journal?.length ?? 0,
         snapshots: snapshots?.length ?? 0,
       }),
-      { headers: { 'Content-Type': 'application/json' } },
+      { headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } },
     )
   } catch (e) {
     return new Response(
       JSON.stringify({ ok: false, error: (e as Error).message }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } },
+      { status: 500, headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } },
     )
   }
 })

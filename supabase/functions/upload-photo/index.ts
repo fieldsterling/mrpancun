@@ -1,15 +1,14 @@
-// COS 快照备份函数：服务端代传，避免在前端暴露 COS 永久密钥
+// 产品照片上传函数：把客户端传来的 base64 照片写入 COS（服务端代传，避免在前端暴露 COS 永久密钥）
 //
-// 备份路径（项目所有文档统一存放在 COS 的 mrpancun 文件夹下）：
-//   mrpancun/{店名}/{年}/{月}/{日期}/products.json、journal.jsonl、snapshot.json
+// 上传路径：mrpancun/photos/{店名}/{产品编号}.jpg
+// （项目所有文档统一存放在 COS 的 mrpancun 文件夹下）
 //
 // 部署（在 supabase/ 目录）：
-//   supabase functions deploy backup-cos --no-verify-jwt
+//   supabase functions deploy upload-photo --no-verify-jwt
 // 需要环境变量：
 //   COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET, COS_REGION
-//   （在 Supabase 控制台 Edge Functions 的 Secrets 中配置，密钥不会暴露到前端）
 //
-// 实现：使用 COS V5 签名算法（HMAC-SHA1） + 标准 fetch PUT，无需第三方依赖。
+// 实现：与 backup-cos 相同，使用 COS V5 签名算法（HMAC-SHA1）+ 标准 fetch PUT。
 
 const enc = new TextEncoder()
 
@@ -40,24 +39,24 @@ function cosEncodePath(p: string): string {
   return encodeURIComponent(p).replace(/%2F/gi, '/')
 }
 
-/** PUT 一个对象到 COS（V5 签名） */
+/** PUT 一个二进制对象到 COS（V5 签名） */
 async function putObject(opts: {
   secretId: string
   secretKey: string
   host: string
   key: string
-  body: string
+  body: Uint8Array
+  contentType: string
 }): Promise<void> {
-  const { secretId, secretKey, host, key, body } = opts
-  const contentType = 'application/json'
+  const { secretId, secretKey, host, key, body, contentType } = opts
   const start = Math.floor(Date.now() / 1000)
   const end = start + 600
   const keyTime = `${start};${end}`
 
   const signKey = await hmacSha1Hex(secretKey, keyTime)
-  const rawUri = '/' + key // 签名用：原始未编码路径（COS 对中文路径按解码后路径计算签名）
+  const rawUri = '/' + key // 签名用：原始未编码路径
   const encUri = '/' + cosEncodePath(key) // 请求用：URL 编码路径
-  // HttpHeaders 中的值必须做 URL 编码（如 application/json -> application%2Fjson），
+  // HttpHeaders 中的值必须做 URL 编码（如 image/jpeg -> image%2Fjpeg），
   // 否则服务端重建的签名串不一致，报 SignatureDoesNotMatch
   const httpHeaders = `content-type=${encodeURIComponent(contentType)}&host=${encodeURIComponent(host)}`
   const httpString = `put\n${rawUri}\n\n${httpHeaders}\n`
@@ -80,24 +79,16 @@ async function putObject(opts: {
   }
 }
 
-/** 组装本次备份的 JSON / JSONL 文件 */
-function buildFiles(payload: {
-  store: string
-  businessDate: string
-  products: unknown[]
-  journal: unknown[]
-  snapshots: unknown[]
-}): Array<{ key: string; body: string }> {
-  const d = payload.businessDate.split('-') // YYYY-MM-DD
-  const base = `mrpancun/${payload.store}/${d[0]}/${d[1]}/${payload.businessDate}`
-  return [
-    { key: `${base}/products.json`, body: JSON.stringify(payload.products, null, 2) },
-    {
-      key: `${base}/journal.jsonl`,
-      body: payload.journal.map((j) => JSON.stringify(j)).join('\n'),
-    },
-    { key: `${base}/snapshot.json`, body: JSON.stringify(payload.snapshots, null, 2) },
-  ]
+/** dataURL（data:image/jpeg;base64,...）→ 字节 + mime */
+function dataUrlToBytes(dataUrl: string): { bytes: Uint8Array; mime: string } {
+  const comma = dataUrl.indexOf(',')
+  const head = comma >= 0 ? dataUrl.slice(0, comma) : ''
+  const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl
+  const mime = /data:([^;]+);/.exec(head)?.[1] ?? 'image/jpeg'
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return { bytes, mime }
 }
 
 // 浏览器直调需要 CORS：Supabase 不会自动给函数响应加跨域头，必须自己处理 OPTIONS 预检
@@ -120,9 +111,9 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const payload = await req.json()
-    if (!payload?.businessDate || !payload?.store) {
-      throw new Error('缺少 store / businessDate')
+    const { store, code, dataUrl } = await req.json()
+    if (typeof store !== 'string' || typeof code !== 'string' || typeof dataUrl !== 'string') {
+      throw new Error('缺少 store / code / dataUrl')
     }
 
     const secretId = Deno.env.get('COS_SECRET_ID')
@@ -133,21 +124,15 @@ Deno.serve(async (req) => {
       throw new Error('未配置 COS_SECRET_ID / COS_SECRET_KEY / COS_BUCKET / COS_REGION')
     }
 
+    const key = `mrpancun/photos/${store}/${code}.jpg`
     const host = `${bucket}.cos.${region}.myqcloud.com`
-    const files = buildFiles({
-      store: payload.store,
-      businessDate: payload.businessDate,
-      products: payload.products ?? [],
-      journal: payload.journal ?? [],
-      snapshots: payload.snapshots ?? [],
-    })
+    const { bytes, mime } = dataUrlToBytes(dataUrl)
+    const contentType = mime.startsWith('image/') ? mime : 'image/jpeg'
 
-    for (const f of files) {
-      await putObject({ secretId, secretKey, host, key: f.key, body: f.body })
-    }
+    await putObject({ secretId, secretKey, host, key, body: bytes, contentType })
 
     return new Response(
-      JSON.stringify({ ok: true, files: files.map((f) => f.key) }),
+      JSON.stringify({ ok: true, url: `https://${host}/${cosEncodePath(key)}` }),
       { headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } },
     )
   } catch (e) {

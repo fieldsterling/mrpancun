@@ -5,6 +5,8 @@ import { fileURLToPath, URL } from 'node:url'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // 部署到 zhaowo.jia.gold 的 /mrpancun/ 子路径，资源相对该路径加载
+  base: '/mrpancun/',
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

@@ -45,6 +45,7 @@ export function reconcile(input: ReconcileInput): DiffRow[] {
       actualQty,
       diff,
       status,
+      gramWeight: p?.gram_weight ?? 0,
     })
   }
 
@@ -66,4 +67,28 @@ export function buildProductIndex(products: Product[]): Map<string, Product> {
   const m = new Map<string, Product>()
   for (const p of products) m.set(p.code, p)
   return m
+}
+
+/** 单件金额：优先用「总价 ÷ 数量」反推单价，否则用 克重×(克单价+克工费)+件工费 */
+export function unitPrice(p: Product | undefined): number {
+  if (!p) return 0
+  if (p.qty > 0 && p.total_price > 0) return p.total_price / p.qty
+  return (p.gram_weight || 0) * ((p.gram_price || 0) + (p.gram_fee || 0)) + (p.piece_fee || 0)
+}
+
+/** 按编号累加产品的 数量/克重/金额 汇总 */
+export function sumByCode(
+  map: Map<string, number>,
+  productIndex?: Map<string, Product>,
+): { qty: number; weight: number; amount: number } {
+  let qty = 0
+  let weight = 0
+  let amount = 0
+  for (const [code, n] of map) {
+    const p = productIndex?.get(code)
+    qty += n
+    weight += (p?.gram_weight ?? 0) * n
+    amount += unitPrice(p) * n
+  }
+  return { qty, weight, amount }
 }
