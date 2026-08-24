@@ -1,0 +1,465 @@
+Local-first + Supabase 日同步 + COS/JSON 快照备份。终端日常操作本地完成，保证扫描和比对极快；Supabase 作为权威数据库，每天汇总/上传；GitHub + 腾讯 EdgeOne + COS 负责静态部署和文件存储。
+
+一、总体架构
+text
+终端设备（扫码枪 + 浏览器/PWA）
+   ├─ 本地数据：IndexedDB / SQLite(WASM) + JSON
+   ├─ 盘存引擎：扫描、Excel/TXT导入、差异比对
+   └─ 同步层：Supabase + 腾讯 COS
+
+部署：
+GitHub 代码仓库
+   └─ 腾讯 EdgeOne Pages / CDN
+          └─ 静态前端资源
+          └─ COS：JSON 快照、导入文件、备份
+推荐技术栈
+层	选型
+前端	Vite + React/Vue3 + TypeScript
+本地数据库	Dexie.js（IndexedDB）或 SQLite WASM
+Excel解析	SheetJS xlsx
+后端数据库	Supabase PostgreSQL
+文件存储	腾讯 COS + cos-js-sdk-v5
+部署	GitHub + 腾讯 EdgeOne Pages
+扫码	原生键盘输入，无需额外库
+二、三张表数据模型
+1. 产品信息表 products
+注意：同一产品在不同门店建议用 (编号, 店名) 作为主键，否则多店库存会互相覆盖。
+
+sql
+create table products (
+  code text not null,               -- 产品编号
+  store text not null,              -- 店名
+  category text,                    -- 类别
+  name text,                        -- 名称
+  material text,                    -- 材质
+  qty numeric(14,3) not null default 0 check (qty >= 0),
+  gram_weight numeric(12,3),        -- 克重
+  gram_price numeric(12,2),         -- 克单价
+  total_price numeric(16,2),        -- 总价，可由公式生成
+  barcode text,                     -- 可选：条码，扫码枪可能需要
+  updated_at timestamptz not null default now(),
+
+  primary key (code, store)
+);
+
+-- 若总价 = 克重 * 克单价 * 数量，可用生成列：
+-- total_price numeric(16,2) generated always as (gram_weight * gram_price * qty) stored
+2. 进出库日记表 inventory_journal
+sql
+create table inventory_journal (
+  id bigint generated always as identity primary key,
+  source_id text not null unique,    -- 客户端生成，防止重复同步
+  ts timestamptz not null default now(),
+  product_code text not null,
+  store text not null,
+  direction text not null check (direction in ('IN', 'OUT')),
+  qty numeric(14,3) not null check (qty > 0),
+  note text,
+
+  foreign key (product_code, store) references products(code, store)
+);
+
+create index idx_journal_product_time on inventory_journal(product_code, store, ts desc);
+create index idx_journal_store_time on inventory_journal(store, ts desc);
+3. 每日实际盘存结果表 daily_inventory_snapshot
+sql
+create table daily_inventory_snapshot (
+  business_date date not null,
+  product_code text not null,
+  store text not null,
+  actual_qty numeric(14,3) not null check (actual_qty >= 0),
+  updated_at timestamptz not null default now(),
+
+  primary key (business_date, product_code, store)
+);
+说明：表3不建外键到产品表，因为实际盘存可能出现“数据库没有但实物有”的未知产品编号。
+
+三、JSON 数据结构
+你可以把三张表在本地保存为 JSON 文件，方便导入导出和 COS 备份。
+
+json
+{
+  "products": [
+    {
+      "code": "P001",
+      "store": "深圳店",
+      "category": "黄金",
+      "name": "足金手镯",
+      "material": "Au999",
+      "qty": 10,
+      "gram_weight": 20.5,
+      "gram_price": 520,
+      "total_price": 106600
+    }
+  ],
+  "journal": [
+    {
+      "source_id": "uuid",
+      "ts": "2026-08-25T09:00:00+08:00",
+      "product_code": "P001",
+      "store": "深圳店",
+      "direction": "IN",
+      "qty": 2
+    }
+  ],
+  "snapshots": [
+    {
+      "business_date": "2026-08-25",
+      "product_code": "P001",
+      "store": "深圳店",
+      "actual_qty": 9
+    }
+  ]
+}
+建议 journal 使用 NDJSON/JSONL 一行一条，方便追加和流式读取。
+
+四、盘存比对引擎
+这是核心逻辑，两种盘存方式最终都进入同一个比对函数。
+
+数据结构
+ts
+// 数据库当前库存
+const systemMap = new Map<string, number>();
+// 扫描/导入得到的实际库存
+const actualMap = new Map<string, number>();
+
+// 例如：
+// systemMap.set("P001", 10)
+// actualMap.set("P001", 9)
+比对算法
+ts
+function reconcile(
+  systemMap: Map<string, number>,
+  actualMap: Map<string, number>
+) {
+  const codes = new Set([
+    ...systemMap.keys(),
+    ...actualMap.keys()
+  ]);
+
+  const details = [];
+
+  for (const code of codes) {
+    const systemQty = systemMap.get(code) ?? 0;
+    const actualQty = actualMap.get(code) ?? 0;
+    const diff = actualQty - systemQty;
+
+    let status: 'MATCH' | 'SYSTEM_MISSING' | 'SYSTEM_EXTRA';
+
+    if (diff === 0) {
+      status = 'MATCH';
+    } else if (diff < 0) {
+      // 数据库多，实际少
+      status = 'SYSTEM_MISSING';
+    } else {
+      // 实际多，数据库少
+      status = 'SYSTEM_EXTRA';
+    }
+
+    details.push({
+      code,
+      systemQty,
+      actualQty,
+      diff,
+      status
+    });
+  }
+
+  return details;
+}
+结果状态
+状态	含义	差异 diff
+MATCH	实际与数据库一致	0
+SYSTEM_MISSING	数据库多，实际少/没有	负数
+SYSTEM_EXTRA	实际多，数据库少/没有	正数
+前端展示建议：
+
+产品编号	名称	系统数量	实盘数量	差异	状态
+P001	足金手镯	10	9	-1	盘亏
+P002	足金戒指	5	6	+1	盘盈
+五、扫描枪方案
+扫描枪本质是键盘输入，会快速输入一串编号并触发 Enter。
+
+前端实现要点
+tsx
+<input
+  autoFocus
+  onKeyDown={(e) => {
+    if (e.key === 'Enter') {
+      const code = e.currentTarget.value.trim();
+      e.currentTarget.value = '';
+
+      if (code) {
+        actualMap.set(code, (actualMap.get(code) ?? 0) + 1);
+        renderActualList();
+      }
+    }
+  }}
+/>
+注意事项
+保持焦点：点击空白区域后自动重新聚焦到扫码输入框。
+
+条码映射：如果条码不是产品编号，需要在产品表增加 barcode 字段，并做映射查询。
+
+防重复扫描：一件产品只能扫一次；同一编号多次扫描会增加数量。
+
+声音/视觉反馈：扫到未知编号时红色提示，正常时绿色提示。
+
+手动修正：列表里允许手动修改某编号的实盘数量。
+
+六、Excel / TXT 导入比对
+1. Excel 导入
+使用 SheetJS 解析：
+
+ts
+import * as XLSX from 'xlsx';
+
+const wb = XLSX.read(await file.arrayBuffer());
+const ws = wb.Sheets[wb.SheetNames[0]];
+const rows = XLSX.utils.sheet_to_json(ws);
+模板建议：
+
+产品编号	数量	店名
+P001	9	深圳店
+P002	6	深圳店
+如果文件里没有店名，则默认使用当前终端所属店名。
+
+2. TXT 导入
+支持两种格式：
+
+A. 每行一个编号，表示该产品实盘数量 +1
+text
+P001
+P001
+P002
+解析后：P001 = 2，P002 = 1
+
+B. 每行编号 + 数量
+text
+P001,9
+P002 6
+P003	3
+解析代码：
+
+ts
+const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+for (const line of lines) {
+  const [code, qtyStr] = line.split(/[\t,，\s]+/);
+  const qty = qtyStr ? Number(qtyStr) : 1;
+  actualMap.set(code, (actualMap.get(code) ?? 0) + qty);
+}
+导入后立即执行 reconcile 显示差异结果。
+
+七、表3“当天最后一次确认覆盖”实现
+逻辑要求
+同一天、同一门店、同一产品，多次确认只保留最后一次。
+
+如果当天第二次确认时，某产品没有出现，之前的记录应被覆盖，不能残留。
+
+推荐做法：事务内先删除当天门店快照，再插入本次完整结果
+sql
+begin;
+
+delete from daily_inventory_snapshot
+where business_date = :business_date
+  and store = :store;
+
+insert into daily_inventory_snapshot (
+  business_date, product_code, store, actual_qty
+)
+select
+  :business_date,
+  key,
+  :store,
+  value::numeric
+from jsonb_each_text(:actual_map);
+
+commit;
+本地 JSON 同理
+确认时，直接覆盖本地 snapshots 中当天门店的数据：
+
+ts
+localSnapshots = localSnapshots.filter(
+  s => !(s.business_date === today && s.store === currentStore)
+);
+
+for (const [code, qty] of actualMap) {
+  localSnapshots.push({
+    business_date: today,
+    product_code: code,
+    store: currentStore,
+    actual_qty: qty,
+    updated_at: new Date().toISOString()
+  });
+}
+八、同步到 Supabase
+同步策略
+日常操作：写本地 IndexedDB + 本地 JSON。
+
+日终/确认：调用 Supabase Edge Function 批量上传。
+
+支持手动“立即同步”按钮。
+
+如果终端始终在线，也可以每 5 分钟增量同步一次。
+
+Edge Function 示例
+ts
+Deno.serve(async (req) => {
+  const { products, journal, snapshots } = await req.json();
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  if (products?.length) {
+    await supabase.from('products').upsert(products, { onConflict: 'code,store' });
+  }
+
+  if (journal?.length) {
+    await supabase.from('inventory_journal').upsert(journal, { onConflict: 'source_id' });
+  }
+
+  if (snapshots?.length) {
+    await supabase.from('daily_inventory_snapshot').upsert(snapshots, {
+      onConflict: 'business_date,product_code,store'
+    });
+  }
+
+  return new Response(JSON.stringify({ ok: true }));
+});
+注意：source_id 用于防止 journal 重复同步。每次客户端生成一条 journal 时，都要带唯一 source_id。
+
+九、COS 备份与 JSON 文件
+推荐在每天同步后，把当天 JSON 快照上传到 COS。
+
+路径建议：
+
+text
+inventory/
+  深圳店/
+    2026/
+      08/
+        2026-08-25/
+          products.json
+          journal.jsonl
+          snapshot.json
+COS 直传安全
+不要在前端暴露永久密钥。两种方式：
+
+Supabase Edge Function 换取临时 STS 密钥，前端使用临时密钥直传 COS。
+
+由 Edge Function 代传 COS，前端只传 Supabase。
+
+十、GitHub + 腾讯 EdgeOne + COS 部署
+1. GitHub 仓库结构
+text
+inventory-system/
+  src/
+    features/
+      scan/
+      import/
+      reconcile/
+      sync/
+    lib/
+      localDb.ts
+      cos.ts
+      supabase.ts
+  public/
+    templates/
+      盘存导入模板.xlsx
+  supabase/
+    migrations/
+      001_schema.sql
+    functions/
+      sync-daily/
+        index.ts
+  package.json
+  vite.config.ts
+2. EdgeOne Pages 部署
+将 GitHub 仓库连接到腾讯 EdgeOne Pages。
+
+构建命令：npm run build
+
+输出目录：dist
+
+环境变量：
+
+VITE_SUPABASE_URL
+
+VITE_SUPABASE_ANON_KEY
+
+VITE_COS_BUCKET
+
+VITE_COS_REGION
+
+3. PWA 加速
+建议把应用做成 PWA，扫码终端可以安装到桌面，二次打开几乎秒开。
+
+十一、盘存确认后的库存调整
+盘存结果不能只记录在表3，否则表1库存不会变化。
+
+建议在“确认盘存”时提供两个选项：
+
+选项 1：仅记录盘存结果
+只写表3，不改表1和表2。
+
+选项 2：记录并调整库存（推荐）
+写表3实际数量。
+
+对每个有差异的产品生成表2流水：
+
+实际 > 系统：生成 IN 流水，数量 = diff
+
+实际 < 系统：生成 OUT 流水，数量 = abs(diff)
+
+更新表1产品数量为实际数量。
+
+这样可以保持：
+当前库存 = 期初库存 + IN - OUT，数据才能审计。
+
+十二、多终端风险提示
+如果同一个店只有一台终端，Local-first 完全没问题。
+
+如果多台终端同时盘点，本地 JSON 容易冲突。建议：
+
+以 Supabase 作为唯一权威库存源。
+
+终端只做本地缓存 + 快速比对。
+
+每次扫描后如果在线，立即写入 Supabase。
+
+如果离线，写入本地队列，联网后按时间顺序重放。
+
+如果多终端并发要求不高，也可以每天固定一台终端盘点，其他终端只读。
+
+十三、开发里程碑建议
+阶段	内容
+P0	单店单终端：本地 JSON、扫码、Excel/TXT导入、比对、表3覆盖
+P1	接入 Supabase 三张表，每日同步，COS JSON 备份
+P2	多店/多终端、用户登录、权限、盘存调整库存
+P3	条码映射、报表、审计日志、差异自动推送
+十四、需要你确认的几个关键点
+产品编号是否全局唯一？
+如果同一编号在不同门店都存在，必须用 (编号, 店名) 做联合主键。
+
+总价公式是什么？
+是否为 克重 × 克单价 × 数量？如果不是，建议存普通字段。
+
+表3是否只记录实盘数量，还是要同时调整表1库存？
+建议“确认后调整库存”，否则表1和表3会一直不一致。
+
+扫描枪扫的是产品编号还是条码？
+如果是条码，需要在产品表增加 barcode 字段。
+
+Excel/TXT 格式能否固定？
+建议固定为：产品编号,数量,店名，避免解析复杂度。
+
+十五、补充
+1、注意时间，supabase默认时间，是不是中国时间，有没有GMT+8问题。
+2、用户可能多个门店要共用库存表，编号很有可能是有一样，那么唯一是编号+门店的唯一性。
+3、所有盘存数据表加前缀mrpancun_
+
+这套方案的核心优势是：
+扫码盘存本地毫秒级响应，不依赖网络；确认后统一同步 Supabase；三张表关系清晰，可审计、可备份、可恢复。

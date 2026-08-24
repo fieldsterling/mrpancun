@@ -1,0 +1,29 @@
+{
+  "name": "mrpancun-inventory",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "金店每日盘存系统 - Local-first + Supabase 日同步 + COS 备份",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "cos-js-sdk-v5": "^1.6.2",
+    "dexie": "^4.0.8",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.1",
+    "vite-plugin-pwa": "^0.21.1"
+  }
+}
