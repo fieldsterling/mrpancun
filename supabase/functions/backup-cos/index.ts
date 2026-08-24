@@ -55,9 +55,12 @@ async function putObject(opts: {
   const keyTime = `${start};${end}`
 
   const signKey = await hmacSha1Hex(secretKey, keyTime)
-  const uri = cosEncodePath(key)
-  const httpHeaders = `content-type=${contentType}&host=${host}`
-  const httpString = `put\n${uri}\n\n${httpHeaders}\n`
+  const rawUri = '/' + key // 签名用：原始未编码路径（COS 对中文路径按解码后路径计算签名）
+  const encUri = '/' + cosEncodePath(key) // 请求用：URL 编码路径
+  // HttpHeaders 中的值必须做 URL 编码（如 application/json -> application%2Fjson），
+  // 否则服务端重建的签名串不一致，报 SignatureDoesNotMatch
+  const httpHeaders = `content-type=${encodeURIComponent(contentType)}&host=${encodeURIComponent(host)}`
+  const httpString = `put\n${rawUri}\n\n${httpHeaders}\n`
   const stringToSign = `sha1\n${keyTime}\n${await sha1Hex(httpString)}\n`
   const signature = await hmacSha1Hex(signKey, stringToSign)
 
@@ -67,7 +70,7 @@ async function putObject(opts: {
     `&q-header-list=content-type;host&q-url-param-list=` +
     `&q-signature=${signature}`
 
-  const resp = await fetch(`https://${host}${uri}`, {
+  const resp = await fetch(`https://${host}${encUri}`, {
     method: 'PUT',
     headers: { 'Content-Type': contentType, Authorization: authorization },
     body,
